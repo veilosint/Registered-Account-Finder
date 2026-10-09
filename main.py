@@ -1,23 +1,26 @@
 import asyncio
 import json
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from sse_starlette.sse import EventSourceResponse
 from pydantic import BaseModel
-from slowapi import Limiter, _rate_limit_exceeded_handler
-from slowapi.util import get_remote_address
-from slowapi.errors import RateLimitExceeded
 
 from user_scanner.core import engine
 
-# Global dictionary to track active scan tasks
-active_scans: dict[str, asyncio.Queue] = {}
-
+# --- Configuration ---
 RATE_LIMIT = "3/minute"
-limiter = Limiter(key_func=get_remote_address)
-app = FastAPI(title="User Scanner API")
-app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+active_scans = {}
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    yield
+    active_scans.clear()
+
+
+app = FastAPI(title="Email Scanner Live", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -34,22 +37,62 @@ class ScanRequest(BaseModel):
 
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "service": "live-scanner"}
+    return {"status": "ok", "service": "email-scanner-live"}
+
+
+def _result_to_payload(result):
+    """Convert a user-scanner Result object into a JSON-friendly dict."""
+    payload = {}
+
+    # Try the built-in as_dict() first
+    if hasattr(result, "as_dict"):
+        try:
+            payload = result.as_dict()
+            if isinstance(payload, dict):
+                return payload
+        except Exception:
+            pass
+
+    # Fallback: read common attributes manually
+    for attr in ("site", "name", "url", "category", "status", "exists", "extra"):
+        if hasattr(result, attr):
+            try:
+                payload[attr] = getattr(result, attr)
+            except Exception:
+                pass
+
+    return payload
+
+
+def _result_found(result) -> bool:
+    """Determine whether a Result represents a real hit."""
+    # Try common attributes for 'found' state
+    for attr in ("exists", "found", "is_found"):
+        if hasattr(result, attr):
+            try:
+                val = getattr(result, attr)
+                if callable(val):
+                    val = val()
+                return bool(val)
+            except Exception:
+                pass
+    # If the payload has a url, assume it's a hit
+    payload = _result_to_payload(result)
+    return bool(payload.get("url"))
 
 
 async def run_scan_and_stream(queue: asyncio.Queue, email: str):
-    """Run the scan and push hits into the queue as they are found."""
+    """Run the scan and push each hit into the queue as it completes."""
     try:
-        # This is the key part: we need to iterate over results as they complete.
-        # The user-scanner engine might not expose a streaming API directly,
-        # so we run the full scan and push results as they become available.
-        # For true per-site streaming, you would need to modify the engine internals.
         results = await engine.check_all(email, is_email=True)
 
         for result in results:
-            if result.get("exists"):  # Adjust based on actual Result object attribute
-                await queue.put({"type": "hit", "data": result.as_dict()})
-                await asyncio.sleep(0)  # Let the event loop breathe
+            if not _result_found(result):
+                continue
+
+            payload = _result_to_payload(result)
+            await queue.put({"type": "hit", "data": payload})
+            await asyncio.sleep(0)
 
         await queue.put({"type": "done", "data": {}})
     except Exception as e:
@@ -57,18 +100,15 @@ async def run_scan_and_stream(queue: asyncio.Queue, email: str):
 
 
 @app.post("/api/scan/start")
-@limiter.limit(RATE_LIMIT)
-async def start_scan(request: Request, body: ScanRequest):
+async def start_scan(body: ScanRequest):
     email = body.email.strip()
     if not email or "@" not in email:
         raise HTTPException(status_code=400, detail="Invalid email")
 
-    # Create a unique ID for this scan (in a real app, use a UUID)
     scan_id = f"scan_{email}_{id(body)}"
     queue: asyncio.Queue = asyncio.Queue()
     active_scans[scan_id] = queue
 
-    # Fire off the scan in the background
     asyncio.create_task(run_scan_and_stream(queue, email))
 
     return {"scan_id": scan_id}
@@ -83,28 +123,19 @@ async def stream_scan(scan_id: str):
 
     async def event_generator():
         try:
-            # Send a "started" event
-            yield f"event: started\ndata: {json.dumps({'scan_id': scan_id})}\n\n"
+            yield {"event": "started", "data": json.dumps({"scan_id": scan_id})}
 
             while True:
                 item = await queue.get()
                 if item["type"] == "hit":
-                    yield f"event: hit\ndata: {json.dumps(item['data'])}\n\n"
+                    yield {"event": "hit", "data": json.dumps(item["data"])}
                 elif item["type"] == "done":
-                    yield f"event: done\ndata: {{}}\n\n"
+                    yield {"event": "done", "data": "{}"}
                     break
                 elif item["type"] == "error":
-                    yield f"event: error\ndata: {json.dumps(item['data'])}\n\n"
+                    yield {"event": "error", "data": json.dumps(item["data"])}
                     break
         finally:
-            # Cleanup when the client disconnects
             active_scans.pop(scan_id, None)
 
-    return StreamingResponse(
-        event_generator(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",  # Disables buffering on Render/nginx [citation:3]
-        },
-    )
+    return EventSourceResponse(event_generator())
